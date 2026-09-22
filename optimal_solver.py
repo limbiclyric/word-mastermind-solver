@@ -4,6 +4,7 @@
   --rms      minimize root-mean-square of guesses (risk-averse)
   --cynic    minimize worst-case guesses (minimax with alpha-beta)
 No flag: fast/greedy (min expected partition size).
+Hard-mode rules are OFF by default (easy mode); --hard enforces them.
 """
 from __future__ import annotations
 import atexit, gc, os, time, math, argparse
@@ -74,19 +75,21 @@ def _legal_guess_mask(greens, must_include, forbidden_pos, remaining) -> np.ndar
 
 PATTERN_TABLE: np.ndarray
 _SQ = 1  # score power: 1 for --average, 2 for --rms
+_HARD = False  # enforce hard-mode legality when True (--hard)
 
-def _init_globals(shm_name, ng, na, sq):
+def _init_globals(shm_name, ng, na, sq, hard):
     """Attach to the shared-memory pattern table (one physical copy for all
     workers) instead of pickling an 800MB array into every process."""
-    global PATTERN_TABLE, _SHM, _SQ
+    global PATTERN_TABLE, _SHM, _SQ, _HARD
     _SQ = sq
+    _HARD = hard
     _SHM = _shm_mod.SharedMemory(name=shm_name)
     PATTERN_TABLE = np.frombuffer(_SHM.buf, dtype=np.uint8).reshape(ng, na)
     # Release deterministically before interpreter teardown, where __del__
     # ordering is undefined and may otherwise fire while the array still
     # holds a buffer export on the mmap.
     atexit.register(_worker_shm_cleanup)
-    nb.set_num_threads(1)  # pool workers each own a core; inner threads would oversubscribe
+    nb.set_num_threads(1)  # Prevent inner threads from oversubscribing
 
 def _worker_shm_cleanup():
     global PATTERN_TABLE, _SHM
@@ -96,7 +99,6 @@ def _worker_shm_cleanup():
         _SHM = None
 
 # ─────────────────── pattern pre-computation ──────────────────
-
 @nb.njit(cache=True, fastmath=True)
 def _pattern_code(g: np.ndarray, t: np.ndarray) -> int:
     code, pow3 = 0, 1
@@ -194,23 +196,28 @@ def _state_key(remaining: np.ndarray, history: Sequence[Tuple[str, tuple]]) -> t
     return (tuple(remaining.tolist()), len(history), ckey)
 
 def _rank_legal_guesses(remaining, history, exp_buf=None):
-    """Top-k hard-mode-legal candidate guesses, ranked by expected partition
-    size. Filter to legal guesses BEFORE scoring: the scoring kernel is
-    O(legal x |remaining|) instead of O(NG x |remaining|)."""
-    greens, must_inc, forb = _derive_constraints(history)
-    legal_rows = np.flatnonzero(_legal_guess_mask(greens, must_inc, forb, remaining))
+    """Top-k legal guesses, ranked by expected partition size. Hard mode:
+    legal under the constraints implied by the history. Easy mode (_HARD
+    False): every guess is legal. Filter to legal guesses BEFORE scoring: the
+    scoring kernel is O(legal x |remaining|) instead of O(NG x |remaining|)."""
+    if _HARD:
+        greens, must_inc, forb = _derive_constraints(history)
+        legal_rows = np.flatnonzero(_legal_guess_mask(greens, must_inc, forb, remaining))
+    else:
+        legal_rows = None
     k_child = _adaptive_k(len(remaining))
-    if legal_rows.size * 4 > NG:
-        # Constraints bite weakly here: scoring all guesses and filtering
-        # afterwards is cheaper than the subset gather.
+    if legal_rows is None or legal_rows.size * 4 > NG:
+        # Constraints bite weakly here (or are off): scoring all guesses and
+        # filtering afterwards is cheaper than the subset gather.
         exp = _expect_all(remaining)
         cand_idx = np.argpartition(exp, k_child)[:k_child] if k_child < NG else np.arange(NG)
         cand_idx = sorted(cand_idx, key=lambda i: exp[i])
-        legal_set = set(legal_rows.tolist())
-        cand_idx = [int(gi) for gi in cand_idx if gi in legal_set]
-        if not cand_idx:
-            # No legal word in the global top-k: rank the legal ones directly.
-            cand_idx = [int(legal_rows[i]) for i in np.argsort(exp[legal_rows])]
+        if legal_rows is not None:
+            legal_set = set(legal_rows.tolist())
+            cand_idx = [int(gi) for gi in cand_idx if gi in legal_set]
+            if not cand_idx:
+                # No legal word in the global top-k: rank the legal ones directly.
+                cand_idx = [int(legal_rows[i]) for i in np.argsort(exp[legal_rows])]
     else:
         exp = _expect_rows(PATTERN_TABLE[legal_rows[:, None], remaining])
         if k_child < legal_rows.size:
@@ -462,9 +469,11 @@ def _build_pattern_table():
 
 def select_next_guess(history: Sequence[Tuple[str, Sequence[int]]],
                       mode: str = "greedy",
+                      hard: bool = False,
                       ) -> List[str]:
-    global _SQ
+    global _SQ, _HARD
     _SQ = {"average": 1, "rms": 2}.get(mode, 1)
+    _HARD = hard
     _build_pattern_table()
 
     remaining = np.arange(NA, dtype=np.int32)
@@ -487,9 +496,9 @@ def select_next_guess(history: Sequence[Tuple[str, Sequence[int]]],
         return [GUESSES[int(best_exp_guess)]]
 
     search_func = _cynic_worker if mode == "cynic" else _expectimim_worker
-    # Same candidate ranking the tree searches use: hard-mode-legal guesses,
-    # ranked by expected partition size (with its built-in fallback when the
-    # legal words rank poorly in the global top-k).
+    # Same candidate ranking the tree searches use: legal guesses (hard mode
+    # filters by the history's constraints; easy mode ranks all of them),
+    # ranked by expected partition size.
     roots = _rank_legal_guesses(remaining, list(history))
 
     best_score = float('inf')
@@ -498,7 +507,7 @@ def select_next_guess(history: Sequence[Tuple[str, Sequence[int]]],
 
     ctx = get_context("spawn")
     try:
-        with ProcessPoolExecutor(mp_context=ctx, initializer=_init_globals, initargs=(_SHM.name, NG, NA, _SQ)) as pool:
+        with ProcessPoolExecutor(mp_context=ctx, initializer=_init_globals, initargs=(_SHM.name, NG, NA, _SQ, _HARD)) as pool:
             if mode == "cynic":
                 # Two stages. Stage 1 (fast): every root runs the fail-hard
                 # length-only search pruned against the greedy seed's length;
@@ -579,13 +588,30 @@ if __name__ == "__main__":
     g.add_argument("--average", action="store_true", help="Minimize expected guesses (expectiminimax).")
     g.add_argument("--rms", action="store_true", help="Minimize root-mean-square of guesses (risk-averse).")
     g.add_argument("--cynic", action="store_true", help="Minimize worst-case guesses (minimax).")
+    parser.add_argument("--hard", action="store_true", help="Enforce hard-mode rules (default: easy mode).")
     args = parser.parse_args()
     mode = "average" if args.average else "rms" if args.rms else "cynic" if args.cynic else "greedy"
 
-    HISTORY: List[Tuple[str, Sequence[int]]] = []
+    # Recorded outputs below are with --hard (easy mode plays freer words).
+    HISTORY: List[Tuple[str, Sequence[int]]] = [("pings", (2, 0, 0, 0, 1)),]
+
 
     t0 = time.time()
-    next_guess = select_next_guess(HISTORY, mode=mode)
-    print(f"Mode: {mode}")
+    next_guess = select_next_guess(HISTORY, mode=mode, hard=args.hard)
+    print(f"Mode: {mode} ({'hard' if args.hard else 'easy'})")
     print("Best next guess(es):", next_guess)
     print(f"Total Elapsed {time.time() - t0:.2f}s")
+    # Cynic next guess(es): ['parse', 'prase', 'patsy', 'presa', 'pesty', 'perst']
+    # RMS next guess(es): ['paste']
+    # Average next guess(es): ['paste']
+
+    HISTORY: List[Tuple[str, Sequence[int]]] = [("logic", (0, 0, 2, 0, 0)),]
+
+    t0 = time.time()
+    next_guess = select_next_guess(HISTORY, mode=mode, hard=args.hard)
+    print(f"Mode: {mode} ({'hard' if args.hard else 'easy'})")
+    print("Best next guess(es):", next_guess)
+    print(f"Total Elapsed {time.time() - t0:.2f}s")
+    # Cynic next guess(es): ['nages', 'augen']
+    # RMS next guess(es): ['rugas']
+    # Average next guess(es): ['rages', 'ragus', 'rugas']
