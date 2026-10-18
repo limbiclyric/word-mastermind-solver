@@ -551,7 +551,8 @@ def select_next_guess(history: Sequence[Tuple[str, Sequence[int]]],
                 best_score, first_set = search_func(first_root, remaining, list(history), None)
                 best_set.update(first_set)
                 print(f"Baseline score from '{GUESSES[first_root]}': {best_score}")
-                threshold = best_score
+                # Workers compare in _SQ power; the threshold must be too.
+                threshold = best_score ** _SQ
                 tasks = [pool.submit(search_func, rg, remaining, list(history), threshold) for rg in roots]
                 for fut in tasks:
                     s, opts = fut.result()
@@ -576,11 +577,15 @@ def select_next_guess(history: Sequence[Tuple[str, Sequence[int]]],
 
 
 
-# Best Starting Words
-# Cynic:    'larns', 'slate'
-#           requires more than six guesses (i.e. game over) in 42 cases
+# Best Hard Mode Starting Words
+# Cynic:    'larns', 'slate' requires more than six guesses (i.e. game over) in 42 cases
 # RMS:      'salet' with score 4.055633125262808
 # Average:  'salet' and 'teals' tie with average guesses = 3.9591121495327104           
+
+# Best Easy Mode Starting Words
+# Cynic:    'ratel', 'dales', 'rance', 'lades' requires six guesses in 2 cases
+# RMS:      'tares' with score 3.9641169421248312
+# Average:  'tares' with average guesses = 3.9142815420560746 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Optimal word-Mastermind solver (default wordlist: NYT Wordle). Scoring heuristic flags (default: fast/greedy).")
@@ -592,8 +597,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     mode = "average" if args.average else "rms" if args.rms else "cynic" if args.cynic else "greedy"
 
-    # Recorded outputs below are with --hard (easy mode plays freer words).
-    HISTORY: List[Tuple[str, Sequence[int]]] = [("pings", (2, 0, 0, 0, 1)),]
+    HISTORY: List[Tuple[str, Sequence[int]]] = []
 
 
     t0 = time.time()
@@ -601,17 +605,5 @@ if __name__ == "__main__":
     print(f"Mode: {mode} ({'hard' if args.hard else 'easy'})")
     print("Best next guess(es):", next_guess)
     print(f"Total Elapsed {time.time() - t0:.2f}s")
-    # Cynic next guess(es): ['parse', 'prase', 'patsy', 'presa', 'pesty', 'perst']
-    # RMS next guess(es): ['paste']
-    # Average next guess(es): ['paste']
 
-    HISTORY: List[Tuple[str, Sequence[int]]] = [("logic", (0, 0, 2, 0, 0)),]
 
-    t0 = time.time()
-    next_guess = select_next_guess(HISTORY, mode=mode, hard=args.hard)
-    print(f"Mode: {mode} ({'hard' if args.hard else 'easy'})")
-    print("Best next guess(es):", next_guess)
-    print(f"Total Elapsed {time.time() - t0:.2f}s")
-    # Cynic next guess(es): ['nages', 'augen']
-    # RMS next guess(es): ['rugas']
-    # Average next guess(es): ['rages', 'ragus', 'rugas']
